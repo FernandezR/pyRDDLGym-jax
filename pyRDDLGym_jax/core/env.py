@@ -1,0 +1,743 @@
+# ***********************************************************************
+# Pure JAX Environment for pyRDDLGym
+#
+# A JAX-native, JIT-compilable environment interface for RDDL domains
+# that supports vectorization, batching, and efficient gradient-based
+# planning and reinforcement learning.
+#
+# Key features:
+# - Fully JIT-compilable reset() and step() functions
+# - No side effects (no logging, no visualization during rollouts)
+# - Support for vmap to run multiple parallel environments
+# - Pure functional interface using JAX pytrees
+# - Static shapes for maximum performance
+#
+# ***********************************************************************
+
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
+import warnings
+
+import jax
+import jax.numpy as jnp
+import jax.random as random
+import numpy as np
+
+from pyRDDLGym.core.compiler.model import RDDLLiftedModel
+from pyRDDLGym.core.parser.parser import RDDLParser
+from pyRDDLGym.core.parser.reader import RDDLReader
+
+from pyRDDLGym_jax.core.compiler import JaxRDDLCompiler
+
+
+# Type aliases for clarity
+Action = Dict[str, jnp.ndarray]
+Observation = Dict[str, jnp.ndarray]
+State = Dict[str, jnp.ndarray]
+PRNGKey = jnp.ndarray
+Params = Any  # Model parameters (pytree)
+
+
+class EnvState(NamedTuple):
+    """State of the environment (all fields needed for stepping).
+
+    This is a JAX pytree that contains all the information needed
+    to step the environment forward. It's designed to be immutable
+    and purely functional.
+
+    Attributes:
+        obs: Current observation (may differ from state in POMDPs)
+        state: Current internal state of the environment
+        subs: Current substitution dictionary (internal state variables)
+        key: PRNG key for stochastic sampling
+        model_params: Model parameters for stateful operations
+        timestep: Current timestep in the episode
+        done: Whether the episode has terminated
+        reward: Cumulative reward (optional, for tracking)
+    """
+    obs: Observation
+    state: State
+    subs: Dict[str, jnp.ndarray]
+    key: PRNGKey
+    model_params: Params
+    timestep: jnp.ndarray
+    done: jnp.ndarray
+    reward: jnp.ndarray
+
+
+class TimeStep(NamedTuple):
+    """A single timestep returned by the environment.
+
+    This follows the dm_env convention but adapted for JAX.
+
+    Attributes:
+        observation: The observation at this timestep
+        reward: The reward received
+        done: Whether the episode terminated naturally (terminal state)
+        truncated: Whether the episode was truncated (time limit)
+        info: Additional information (currently empty dict)
+    """
+    observation: Observation
+    reward: jnp.ndarray
+    done: jnp.ndarray
+    truncated: jnp.ndarray
+    info: Dict[str, Any]
+
+
+class JaxRDDLEnv:
+    """A pure JAX environment for RDDL domains.
+
+    This class provides a JIT-compilable, functional interface to RDDL
+    environments. Unlike the standard RDDLEnv which inherits from gym.Env,
+    this environment:
+
+    1. Uses pure functions for reset() and step()
+    2. Maintains state explicitly in EnvState objects
+    3. Supports vmap for parallel environments
+    4. Has no side effects (no logging, visualization during rollouts)
+    5. Is fully differentiable for gradient-based planning
+    6. Provides action precondition checking (optional, not enforced by default)
+
+    Example usage:
+        ```python
+        # Create environment
+        env = JaxRDDLEnv("domain.rddl", "instance.rddl")
+
+        # Initialize
+        key = jax.random.PRNGKey(42)
+        env_state, timestep = env.reset(key)
+
+        # Step the environment
+        actions = env.sample_random_action(key, env_state)
+        env_state, timestep = env.step(env_state, actions)
+
+        # Check if actions satisfy preconditions (optional)
+        is_valid = env.check_action_preconditions(env_state, actions)
+
+        # Vectorized rollout (multiple parallel environments)
+        keys = jax.random.split(key, num_envs)
+        vmapped_reset = jax.vmap(env.reset)
+        env_states, timesteps = vmapped_reset(keys)
+        ```
+
+    Note:
+        For visualization and logging, use the wrapper classes or
+        evaluate policies outside of JIT-compiled loops.
+
+        Action preconditions are compiled and can be checked using
+        check_action_preconditions(), but are NOT automatically enforced
+        during step() for performance reasons. If you need enforcement,
+        check preconditions before calling step().
+    """
+
+    def __init__(self,
+                 domain: Union[str, RDDLLiftedModel],
+                 instance: Optional[str] = None,
+                 logger: Optional[Any] = None,
+                 python_functions: Optional[Dict[str, Callable]] = None,
+                 **compiler_kwargs) -> None:
+        """Initialize the JAX environment.
+
+        Args:
+            domain: Either a path to RDDL domain file or a RDDLLiftedModel
+            instance: Path to RDDL instance file (if domain is a path)
+            logger: Optional logger for compilation information
+            python_functions: External Python functions callable from RDDL
+            **compiler_kwargs: Additional arguments for the JAX compiler
+        """
+        # Parse and compile the RDDL model
+        if isinstance(domain, RDDLLiftedModel):
+            self.model = domain
+        else:
+            reader = RDDLReader(domain, instance)
+            domain_text = reader.rddltxt
+            parser = RDDLParser(lexer=None, verbose=False)
+            parser.build()
+            rddl = parser.parse(domain_text)
+            self.model = RDDLLiftedModel(rddl)
+
+        # Store basic environment info
+        self.horizon = self.model.horizon
+        self.discount = self.model.discount
+        self.max_allowed_actions = self.model.max_allowed_actions
+        self._is_pomdp = bool(self.model.observ_fluents)
+
+        # Compile to JAX
+        self.compiler = JaxRDDLCompiler(
+            self.model,
+            logger=logger,
+            python_functions=python_functions or {},
+            **compiler_kwargs
+        )
+        self.compiler.compile(log_jax_expr=True, heading='JAX ENVIRONMENT MODEL')
+
+        # Store compiled components
+        self.init_values = self.compiler.init_values
+        self.levels = self.compiler.levels
+        self.traced = self.compiler.traced
+        self.model_params = self.compiler.model_params
+
+        # JIT compile the core functions
+        self._jit_reward = jax.jit(self.compiler.reward)
+        self._jit_cpfs = {cpf: jax.jit(expr)
+                          for cpf, expr in self.compiler.cpfs.items()}
+        self._jit_terminals = [jax.jit(term)
+                               for term in self.compiler.terminations]
+        self._jit_invariants = [jax.jit(inv)
+                                for inv in self.compiler.invariants]
+        self._jit_preconditions = [jax.jit(precond)
+                                   for precond in self.compiler.preconditions]
+
+        # Store noop actions (vectorized form)
+        self.noop_actions = {
+            var: values for (var, values) in self.init_values.items()
+            if self.model.variable_types[var] == 'action-fluent'
+        }
+
+        # Get action and state fluent names
+        self.action_fluents = list(self.model.action_fluents)
+        self.state_fluents = list(self.model.state_fluents)
+        if self._is_pomdp:
+            self.observ_fluents = list(self.model.observ_fluents)
+
+        # Pre-compile the step and reset functions for maximum performance
+        self._jit_step = jax.jit(self._step_impl)
+        self._jit_reset = jax.jit(self._reset_impl)
+
+    @property
+    def is_pomdp(self) -> bool:
+        """Whether this environment is a POMDP (has observations)."""
+        return self._is_pomdp
+
+    def reset(self, key: PRNGKey) -> Tuple[EnvState, TimeStep]:
+        """Reset the environment to initial state.
+
+        This is a pure function that returns a new environment state.
+        It can be JIT-compiled and vmapped for parallel environments.
+
+        Args:
+            key: JAX PRNG key for stochastic initialization
+
+        Returns:
+            env_state: Initial environment state
+            timestep: Initial timestep (with initial observation)
+        """
+        return self._jit_reset(key)
+
+    def _reset_impl(self, key: PRNGKey) -> Tuple[EnvState, TimeStep]:
+        """Internal implementation of reset (to be JIT-compiled)."""
+        # Initialize substitution dict with initial values
+        subs = self.init_values.copy()
+
+        # Extract state
+        state = {
+            var: subs[var] for var in self.state_fluents
+        }
+
+        # Extract observation (for POMDPs) or use state (for MDPs)
+        if self._is_pomdp:
+            obs = {var: subs[var] for var in self.observ_fluents}
+        else:
+            obs = state
+
+        # Check if initially terminal
+        done = self._check_terminals(subs, self.model_params, key)
+
+        # Initialize reward (scalar or vector depending on reward-vector requirement)
+        # We need to check the reward structure from a dummy evaluation
+        dummy_reward, _, _, _ = self._jit_reward(subs, self.model_params, key)
+        initial_reward = jnp.zeros_like(dummy_reward)
+
+        # Create environment state
+        env_state = EnvState(
+            obs=obs,
+            state=state,
+            subs=subs,
+            key=key,
+            model_params=self.model_params,
+            timestep=jnp.array(0, dtype=jnp.int32),
+            done=done,
+            reward=initial_reward
+        )
+
+        # Create initial timestep
+        timestep = TimeStep(
+            observation=obs,
+            reward=initial_reward,
+            done=done,
+            truncated=jnp.array(False, dtype=bool),
+            info={}
+        )
+
+        return env_state, timestep
+
+    def step(self, env_state: EnvState, actions: Action) -> Tuple[EnvState, TimeStep]:
+        """Step the environment forward one timestep.
+
+        This is a pure function that takes the current state and actions,
+        and returns the next state and timestep. It can be JIT-compiled
+        and vmapped for parallel environments.
+
+        Args:
+            env_state: Current environment state
+            actions: Action dictionary (must match action space structure)
+
+        Returns:
+            env_state: Next environment state
+            timestep: Timestep information (observation, reward, done, etc.)
+        """
+        return self._jit_step(env_state, actions)
+
+    def _step_impl(self, env_state: EnvState, actions: Action) -> Tuple[EnvState, TimeStep]:
+        """Internal implementation of step (to be JIT-compiled)."""
+        subs = env_state.subs.copy()
+        subs.update(actions)
+
+        key = env_state.key
+        model_params = env_state.model_params
+
+        # Evaluate CPFs in topological order
+        for cpfs_at_level in self.levels.values():
+            for cpf in cpfs_at_level:
+                cpf_fn = self._jit_cpfs[cpf]
+                value, key, error, model_params = cpf_fn(subs, model_params, key)
+                subs[cpf] = value
+
+        # Compute reward
+        reward, key, error, model_params = self._jit_reward(subs, model_params, key)
+
+        # Update state variables (state' -> state)
+        for state_var, next_state_var in self.model.next_state.items():
+            subs[state_var] = subs[next_state_var]
+
+        # Extract new state
+        state = {var: subs[var] for var in self.state_fluents}
+
+        # Extract observation
+        if self._is_pomdp:
+            obs = {var: subs[var] for var in self.observ_fluents}
+        else:
+            obs = state
+
+        # Check termination conditions
+        done = self._check_terminals(subs, model_params, key)
+
+        # Check truncation (horizon limit)
+        new_timestep = env_state.timestep + 1
+        truncated = new_timestep >= self.horizon
+
+        # Create new environment state
+        new_env_state = EnvState(
+            obs=obs,
+            state=state,
+            subs=subs,
+            key=key,
+            model_params=model_params,
+            timestep=new_timestep,
+            done=done | truncated,
+            reward=env_state.reward + reward
+        )
+
+        # Create timestep
+        timestep = TimeStep(
+            observation=obs,
+            reward=reward,
+            done=done,
+            truncated=truncated,
+            info={}
+        )
+
+        return new_env_state, timestep
+
+    def _check_terminals(self, subs: Dict, model_params: Params, key: PRNGKey) -> jnp.ndarray:
+        """Check if any termination condition is satisfied."""
+        is_terminal = jnp.array(False, dtype=bool)
+        for terminal_fn in self._jit_terminals:
+            result, key, error, model_params = terminal_fn(subs, model_params, key)
+            is_terminal = is_terminal | result
+        return is_terminal
+
+    def _check_preconditions(self, subs: Dict, model_params: Params, key: PRNGKey) -> jnp.ndarray:
+        """Check if all action preconditions are satisfied.
+
+        Returns True if all preconditions are satisfied, False otherwise.
+        """
+        all_satisfied = jnp.array(True, dtype=bool)
+        for precond_fn in self._jit_preconditions:
+            result, key, error, model_params = precond_fn(subs, model_params, key)
+            all_satisfied = all_satisfied & result
+        return all_satisfied
+
+    def check_action_preconditions(self, env_state: EnvState, actions: Action) -> bool:
+        """Check if the given actions satisfy all preconditions.
+
+        This is a utility function that can be used to validate actions
+        before stepping the environment. Note that this creates a copy
+        of the substitution dict and is not automatically called during step().
+
+        Args:
+            env_state: Current environment state
+            actions: Actions to validate
+
+        Returns:
+            satisfied: True if all preconditions are satisfied
+        """
+        subs = env_state.subs.copy()
+        subs.update(actions)
+        return self._check_preconditions(subs, env_state.model_params, env_state.key)
+
+    def sample_random_action(self, key: PRNGKey, env_state: Optional[EnvState] = None) -> Action:
+        """Sample a random action from the action space.
+
+        This is useful for testing and as a baseline policy.
+
+        Args:
+            key: JAX PRNG key
+            env_state: Optional environment state (unused, for API consistency)
+
+        Returns:
+            actions: Random action dictionary
+        """
+        actions = {}
+        for action_var in self.action_fluents:
+            action_shape = jnp.shape(self.noop_actions[action_var])
+            action_range = self.model.action_ranges[action_var]
+
+            if action_range == 'bool':
+                actions[action_var] = random.bernoulli(key, shape=action_shape)
+                key, _ = random.split(key)
+            elif action_range == 'real':
+                # Sample from [-1, 1] as a default
+                actions[action_var] = random.uniform(key, shape=action_shape,
+                                                     minval=-1.0, maxval=1.0)
+                key, _ = random.split(key)
+            elif action_range == 'int':
+                # Sample integers in a reasonable range
+                actions[action_var] = random.randint(key, shape=action_shape,
+                                                     minval=0, maxval=10)
+                key, _ = random.split(key)
+            else:
+                # Enumerated type - sample from objects
+                num_objects = len(self.model.type_to_objects[action_range])
+                actions[action_var] = random.randint(key, shape=action_shape,
+                                                     minval=0, maxval=num_objects)
+                key, _ = random.split(key)
+
+        return actions
+
+    def get_noop_action(self) -> Action:
+        """Get the no-op (default) action.
+
+        Returns:
+            actions: No-op action dictionary
+        """
+        return self.noop_actions.copy()
+
+    def prepare_actions_for_sim(self, actions: Dict[str, Any]) -> Action:
+        """Prepare action dictionary for the vectorized format required by the simulator.
+
+        This function allows flexible action specification and converts it to the
+        internal JAX array format. It supports:
+        - Grounded action names (e.g., "move-north___a0" for specific agent)
+        - Lifted action names (e.g., "move-north" for all agents)
+        - Scalar values for grounded actions
+        - Array values for lifted actions
+        - Automatic type conversion and validation
+
+        Args:
+            actions: Dictionary mapping action names to values. Can use either:
+                    - Grounded names: {"move-north___a0": True, "move-east___a1": True}
+                    - Lifted names: {"move-north": jnp.array([True, False])}
+                    - Mixed: {"move-north___a0": True, "move-east": jnp.array([False, True])}
+
+        Returns:
+            sim_actions: Action dictionary with all actions in vectorized JAX array format
+
+        Raises:
+            ValueError: If action names are invalid, types don't match, or shapes are wrong
+
+        Example:
+            ```python
+            # Grounded actions (for specific agents/objects)
+            actions = {
+                "move-north___a0": True,  # Agent 0 moves north
+                "move-east___a1": True    # Agent 1 moves east
+            }
+            sim_actions = env.prepare_actions_for_sim(actions)
+
+            # Lifted actions (for all agents at once)
+            actions = {
+                "move-north": jnp.array([True, False]),  # Agent 0 north, agent 1 no
+                "move-east": jnp.array([False, True])    # Agent 0 no, agent 1 east
+            }
+            sim_actions = env.prepare_actions_for_sim(actions)
+
+            # Use with step
+            env_state, timestep = env.step(env_state, sim_actions)
+            ```
+        """
+        # Start with a copy of noop actions
+        sim_actions = {action: jnp.copy(value)
+                      for (action, value) in self.noop_actions.items()}
+
+        for (action_name, value) in actions.items():
+            # Parse grounded action name (e.g., "move-north___a0__x1")
+            objects = []
+            ground_action = action_name
+
+            if action_name not in sim_actions:
+                # Try to parse as grounded action
+                action_name, objects = self.model.parse_grounded(action_name)
+
+            # Check that the action is valid
+            if action_name not in sim_actions:
+                raise ValueError(
+                    f'<{action_name}> is not a valid action-fluent, '
+                    f'must be one of {set(sim_actions.keys())}.')
+
+            # Get action type
+            ptype = self.model.action_ranges[action_name]
+
+            # Convert value to JAX array
+            if not isinstance(value, jnp.ndarray):
+                value = jnp.asarray(value)
+
+            # Boolean type conversion
+            if ptype == 'bool':
+                value = jnp.asarray(value, dtype=bool)
+
+            # Grounded assignment (specific object/agent)
+            if objects:
+                if jnp.ndim(value) > 0:
+                    raise ValueError(
+                        f'Grounded value specification of action-fluent <{ground_action}> '
+                        f'received an array where a scalar value is required.')
+
+                # Handle enumerated types - convert object name to index
+                if ptype not in {'bool', 'int', 'real'}:
+                    if isinstance(value.item(), str):
+                        value = jnp.array(self.model.object_to_index.get(value.item(), value.item()))
+
+                # Get the tensor and indices
+                tensor = sim_actions[action_name]
+                indices = self.model.object_indices(objects)
+
+                if len(indices) != jnp.ndim(tensor):
+                    raise ValueError(
+                        f'Grounded action-fluent name <{ground_action}> '
+                        f'requires {jnp.ndim(tensor)} parameters, got {len(indices)}.')
+
+                # Update the tensor at the specified indices
+                sim_actions[action_name] = tensor.at[tuple(indices)].set(value)
+
+            # Vectorized assignment (all objects at once)
+            else:
+                tensor = sim_actions[action_name]
+
+                # Check shape compatibility
+                if jnp.shape(value) != jnp.shape(tensor):
+                    raise ValueError(
+                        f'Value array for action-fluent <{action_name}> must be of shape '
+                        f'{jnp.shape(tensor)}, got array of shape {jnp.shape(value)}.')
+
+                # Handle enumerated types - convert object names to indices
+                if ptype not in {'bool', 'int', 'real'}:
+                    if isinstance(value, (list, tuple)) or (isinstance(value, jnp.ndarray) and value.dtype == object):
+                        # Convert array of object names to indices
+                        value_list = np.asarray(value).flatten().tolist()
+                        indices = [self.model.object_to_index.get(v, v) for v in value_list]
+                        value = jnp.array(indices).reshape(jnp.shape(tensor))
+
+                # Check dtype compatibility
+                expected_dtype = jnp.asarray(tensor).dtype
+                if ptype == 'bool':
+                    value = jnp.asarray(value, dtype=bool)
+                elif ptype == 'int' or ptype not in {'bool', 'int', 'real'}:
+                    value = jnp.asarray(value, dtype=jnp.int32)
+                elif ptype == 'real':
+                    value = jnp.asarray(value, dtype=jnp.float32)
+
+                sim_actions[action_name] = value
+
+        # Validate enumerated type ranges
+        for (action_name, value) in sim_actions.items():
+            ptype = self.model.action_ranges[action_name]
+            if ptype not in {'bool', 'int', 'real'}:
+                max_index = len(self.model.type_to_objects[ptype]) - 1
+                value_arr = jnp.asarray(value)
+                if not jnp.all((value_arr >= 0) & (value_arr <= max_index)):
+                    raise ValueError(
+                        f'Values of action-fluent <{action_name}> of type <{ptype}> '
+                        f'are not valid, must be in the range [0, {max_index}].')
+
+        return sim_actions
+
+    def get_observation_spec(self) -> Dict[str, Tuple[Tuple[int, ...], jnp.dtype]]:
+        """Get the observation space specification.
+
+        Returns:
+            spec: Dictionary mapping observation variable names to (shape, dtype) tuples
+        """
+        spec = {}
+        if self._is_pomdp:
+            fluents = self.observ_fluents
+        else:
+            fluents = self.state_fluents
+
+        for var in fluents:
+            value = self.init_values[var]
+            spec[var] = (jnp.shape(value), jnp.asarray(value).dtype)
+
+        return spec
+
+    def get_action_spec(self) -> Dict[str, Tuple[Tuple[int, ...], jnp.dtype]]:
+        """Get the action space specification.
+
+        Returns:
+            spec: Dictionary mapping action variable names to (shape, dtype) tuples
+        """
+        spec = {}
+        for var in self.action_fluents:
+            value = self.noop_actions[var]
+            spec[var] = (jnp.shape(value), jnp.asarray(value).dtype)
+
+        return spec
+
+
+# ***********************************************************************
+# VECTORIZED ENVIRONMENT WRAPPER
+# ***********************************************************************
+
+class VectorizedJaxRDDLEnv:
+    """Wrapper for running multiple JAX environments in parallel.
+
+    This class provides a convenient interface for vectorized rollouts
+    using vmap. It's particularly useful for:
+    - Parallel policy evaluation
+    - Batch gradient computation
+    - Monte Carlo sampling
+
+    Example:
+        ```python
+        # Create vectorized environment
+        env = JaxRDDLEnv("domain.rddl", "instance.rddl")
+        vec_env = VectorizedJaxRDDLEnv(env, num_envs=100)
+
+        # Parallel reset
+        key = jax.random.PRNGKey(42)
+        keys = jax.random.split(key, 100)
+        env_states, timesteps = vec_env.reset(keys)
+
+        # Parallel step
+        actions = vec_env.sample_random_actions(keys, env_states)
+        env_states, timesteps = vec_env.step(env_states, actions)
+        ```
+    """
+
+    def __init__(self, env: JaxRDDLEnv, num_envs: int):
+        """Initialize vectorized environment.
+
+        Args:
+            env: Base JAX environment to vectorize
+            num_envs: Number of parallel environments
+        """
+        self.env = env
+        self.num_envs = num_envs
+
+        # Create vmapped versions of reset and step
+        self.reset = jax.vmap(env.reset)
+        self.step = jax.vmap(env.step)
+        self.sample_random_actions = jax.vmap(env.sample_random_action)
+
+    def get_noop_actions(self) -> Action:
+        """Get batched no-op actions for all environments.
+
+        Returns:
+            actions: Batched no-op actions with shape (num_envs, ...)
+        """
+        noop = self.env.get_noop_action()
+        return jax.tree_map(lambda x: jnp.tile(x[None, ...], (self.num_envs,) + (1,) * len(x.shape)),
+                           noop)
+
+
+# ***********************************************************************
+# UTILITY FUNCTIONS
+# ***********************************************************************
+
+def rollout(env: JaxRDDLEnv,
+            policy_fn: Callable[[PRNGKey, EnvState], Action],
+            key: PRNGKey,
+            max_steps: Optional[int] = None) -> Tuple[jnp.ndarray, jnp.ndarray, Dict]:
+    """Execute a single episode rollout.
+
+    This function can be JIT-compiled for fast rollouts.
+
+    Args:
+        env: The JAX environment
+        policy_fn: Policy function mapping (key, env_state) -> actions
+        key: PRNG key
+        max_steps: Maximum number of steps (defaults to env.horizon)
+
+    Returns:
+        total_reward: Total accumulated reward
+        num_steps: Number of steps taken
+        info: Additional information dictionary
+    """
+    if max_steps is None:
+        max_steps = env.horizon
+
+    # Reset environment
+    key, reset_key = random.split(key)
+    env_state, timestep = env.reset(reset_key)
+
+    total_reward = jnp.array(0.0)
+
+    def step_fn(carry, _):
+        env_state, total_reward, key, done = carry
+
+        # Sample action from policy
+        key, action_key = random.split(key)
+        actions = policy_fn(action_key, env_state)
+
+        # Step environment (but don't update if already done)
+        new_env_state, timestep = env.step(env_state, actions)
+
+        # Accumulate reward only if not done
+        reward_to_add = jnp.where(done, 0.0, timestep.reward)
+        new_total_reward = total_reward + reward_to_add
+
+        # Check if done
+        new_done = done | timestep.done | timestep.truncated
+
+        return (new_env_state, new_total_reward, key, new_done), timestep
+
+    (final_env_state, total_reward, _, _), timesteps = jax.lax.scan(
+        step_fn,
+        (env_state, total_reward, key, jnp.array(False)),
+        None,
+        length=max_steps
+    )
+
+    num_steps = final_env_state.timestep
+
+    return total_reward, num_steps, {'timesteps': timesteps}
+
+
+def parallel_rollout(env: JaxRDDLEnv,
+                     policy_fn: Callable[[PRNGKey, EnvState], Action],
+                     keys: jnp.ndarray,
+                     max_steps: Optional[int] = None) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Execute multiple parallel episode rollouts.
+
+    Args:
+        env: The JAX environment
+        policy_fn: Policy function mapping (key, env_state) -> actions
+        keys: Array of PRNG keys, one per rollout
+        max_steps: Maximum number of steps per episode
+
+    Returns:
+        total_rewards: Array of total rewards, shape (num_rollouts,)
+        num_steps: Array of episode lengths, shape (num_rollouts,)
+    """
+    vmapped_rollout = jax.vmap(lambda k: rollout(env, policy_fn, k, max_steps))
+    total_rewards, num_steps, _ = vmapped_rollout(keys)
+    return total_rewards, num_steps

@@ -27,6 +27,8 @@ from pyRDDLGym.core.parser.parser import RDDLParser
 from pyRDDLGym.core.parser.reader import RDDLReader
 
 from pyRDDLGym_jax.core.compiler import JaxRDDLCompiler
+from pyRDDLGym_jax.core.constraints import JaxRDDLConstraints
+from pyRDDLGym_jax.core import spaces
 
 
 # Type aliases for clarity
@@ -133,6 +135,7 @@ class JaxRDDLEnv:
                  domain: Union[str, RDDLLiftedModel],
                  instance: Optional[str] = None,
                  logger: Optional[Any] = None,
+                 vectorized: bool = True,
                  python_functions: Optional[Dict[str, Callable]] = None,
                  **compiler_kwargs) -> None:
         """Initialize the JAX environment.
@@ -141,9 +144,14 @@ class JaxRDDLEnv:
             domain: Either a path to RDDL domain file or a RDDLLiftedModel
             instance: Path to RDDL instance file (if domain is a path)
             logger: Optional logger for compilation information
+            vectorized: Whether to use vectorized (array) representation for actions/observations.
+                       If True (default), actions and observations are JAX arrays.
+                       If False, actions and observations are dictionaries of scalars (grounded).
             python_functions: External Python functions callable from RDDL
             **compiler_kwargs: Additional arguments for the JAX compiler
         """
+        # Store vectorization flag
+        self.vectorized = vectorized
         # Parse and compile the RDDL model
         if isinstance(domain, RDDLLiftedModel):
             self.model = domain
@@ -199,6 +207,31 @@ class JaxRDDLEnv:
         if self._is_pomdp:
             self.observ_fluents = list(self.model.observ_fluents)
 
+        # Compute bounds and shapes using JaxRDDLConstraints
+        constraints = JaxRDDLConstraints(
+            self.model,
+            self.init_values,
+            vectorized=self.vectorized
+        )
+        self._bounds = constraints.bounds
+        self._shapes = {var: np.shape(values[0])
+                        for (var, values) in self._bounds.items()}
+
+        # Build observation space
+        if self._is_pomdp:
+            obs_ranges = self.model.observ_ranges
+        else:
+            obs_ranges = self.model.state_ranges
+        if not self.vectorized:
+            obs_ranges = self.model.ground_vars_with_value(obs_ranges)
+        self.observation_space = self._build_space(obs_ranges, is_action=False)
+
+        # Build action space
+        action_ranges = self.model.action_ranges
+        if not self.vectorized:
+            action_ranges = self.model.ground_vars_with_value(action_ranges)
+        self.action_space = self._build_space(action_ranges, is_action=True)
+
         # Pre-compile the step and reset functions for maximum performance
         self._jit_step = jax.jit(self._step_impl)
         self._jit_reset = jax.jit(self._reset_impl)
@@ -207,6 +240,171 @@ class JaxRDDLEnv:
     def is_pomdp(self) -> bool:
         """Whether this environment is a POMDP (has observations)."""
         return self._is_pomdp
+
+    def _build_space(self, ranges: Dict[str, str], is_action: bool) -> spaces.Dict:
+        """Build a JAX space from RDDL variable ranges.
+
+        Args:
+            ranges: Dictionary mapping variable names to their types/ranges
+            is_action: Whether building action space (affects vectorization logic)
+
+        Returns:
+            JAX Dict space containing all variables with appropriate bounds
+        """
+        result = {}
+
+        for var, prange in ranges.items():
+            # Get the shape from _shapes
+            shape = self._shapes[var]
+
+            # Enumerated type (object type)
+            if prange in self.model.type_to_objects:
+                num_objects = len(self.model.type_to_objects[prange])
+                if self.vectorized:
+                    # Vectorized: use Box for array of discrete values
+                    result[var] = spaces.Box(
+                        low=0,
+                        high=num_objects - 1,
+                        shape=shape,
+                        dtype=jnp.int32
+                    )
+                else:
+                    # Grounded: use Discrete for scalar value
+                    result[var] = spaces.Discrete(num_objects, dtype=jnp.int32)
+
+            # Real values
+            elif prange == 'real':
+                # Get bounds from constraints
+                low, high = self._bounds[var]
+                result[var] = spaces.Box(
+                    low=low,
+                    high=high,
+                    shape=shape,
+                    dtype=jnp.float32
+                )
+
+            # Boolean values
+            elif prange == 'bool':
+                if self.vectorized:
+                    # Vectorized: use Box for array of booleans (0/1)
+                    result[var] = spaces.Box(
+                        low=0,
+                        high=1,
+                        shape=shape,
+                        dtype=jnp.int32
+                    )
+                else:
+                    # Grounded: use Discrete for scalar boolean
+                    result[var] = spaces.Discrete(2, dtype=jnp.int32)
+
+            # Integer values
+            elif prange == 'int':
+                # Get bounds from constraints
+                low, high = self._bounds[var]
+                # Clip to int32 range
+                low = jnp.maximum(low, jnp.iinfo(jnp.int32).min)
+                high = jnp.minimum(high, jnp.iinfo(jnp.int32).max)
+
+                if self.vectorized:
+                    result[var] = spaces.Box(
+                        low=low,
+                        high=high,
+                        shape=shape,
+                        dtype=jnp.int32
+                    )
+                else:
+                    # For grounded, use a large discrete space
+                    result[var] = spaces.Discrete(
+                        int(high - low + 1),
+                        dtype=jnp.int32
+                    )
+            else:
+                raise ValueError(
+                    f'Range <{prange}> of variable <{var}> is not valid, '
+                    f'must be an enumerated or primitive type.'
+                )
+
+        return spaces.Dict(result)
+
+    def _flatten_space(self, dict_space: spaces.Dict) -> Tuple[spaces.Box, Callable, Callable]:
+        """Flatten a Dict space into a 1D vector Box space.
+
+        This is useful for neural networks that expect flat input/output vectors
+        instead of structured dictionaries.
+
+        Args:
+            dict_space: Dictionary space to flatten
+
+        Returns:
+            flat_space: 1D Box space representing the flattened space
+        """
+        # Collect information about each variable
+        var_infos = []
+        total_size = 0
+
+        for var_name in sorted(dict_space.keys()):
+            space = dict_space[var_name]
+            size = int(jnp.prod(jnp.array(space.shape)))
+            var_infos.append({
+                'name': var_name,
+                'shape': space.shape,
+                'dtype': space.dtype,
+                'size': size,
+                'start': total_size,
+                'end': total_size + size,
+                'low': space.low if isinstance(space, spaces.Box) else 0,
+                'high': space.high if isinstance(space, spaces.Box) else (space.n - 1 if isinstance(space, spaces.Discrete) else 1)
+            })
+            total_size += size
+
+        # Determine bounds for the flat space
+        flat_low = jnp.full(total_size, -1e10, dtype=jnp.float32)
+        flat_high = jnp.full(total_size, 1e10, dtype=jnp.float32)
+
+        for info in var_infos:
+            start, end = info['start'], info['end']
+            low, high = info['low'], info['high']
+
+            # Handle scalar bounds
+            if jnp.isscalar(low) or (isinstance(low, jnp.ndarray) and low.shape == ()):
+                flat_low = flat_low.at[start:end].set(float(low))
+            else:
+                flat_low = flat_low.at[start:end].set(jnp.ravel(low).astype(jnp.float32))
+
+            if jnp.isscalar(high) or (isinstance(high, jnp.ndarray) and high.shape == ()):
+                flat_high = flat_high.at[start:end].set(float(high))
+            else:
+                flat_high = flat_high.at[start:end].set(jnp.ravel(high).astype(jnp.float32))
+
+        # Create flat space
+        flat_space = spaces.Box(
+            low=flat_low,
+            high=flat_high,
+            shape=(total_size,),
+            dtype=jnp.float32
+        )
+
+        return flat_space
+
+    def flatten_observation_space(self) -> Tuple[spaces.Box, Callable, Callable]:
+        """Get flattened observation space with flatten/unflatten functions.
+
+        Returns:
+            flat_space: 1D Box space for observations
+            flatten_fn: Function to flatten observations
+            unflatten_fn: Function to unflatten observations
+        """
+        return self._flatten_space(self.observation_space)
+
+    def flatten_action_space(self) -> Tuple[spaces.Box, Callable, Callable]:
+        """Get flattened action space with flatten/unflatten functions.
+
+        Returns:
+            flat_space: 1D Box space for actions
+            flatten_fn: Function to flatten actions
+            unflatten_fn: Function to unflatten actions
+        """
+        return self._flatten_space(self.action_space)
 
     def reset(self, key: PRNGKey) -> Tuple[EnvState, TimeStep]:
         """Reset the environment to initial state.

@@ -630,17 +630,26 @@ class JaxRDDLEnv:
                 possible_values = jnp.arange(low, high + 1, dtype=jnp.int32)
                 num_values = len(possible_values)
 
+                # Pre-create base substitution dict (shared across all checks)
+                # This avoids copying env_state.subs for every check
+                base_subs = env_state.subs
+                model_params = env_state.model_params
+                key = env_state.key
+
                 # Define function to check if a single (agent, action_value) is valid
+                # This function operates on the action array only, not the full subs dict
                 def check_single_action(agent_idx, action_value):
                     # Create test action: this agent takes action_value, others take noop (0)
                     test_action_values = jnp.zeros(num_agents, dtype=jnp.int32)
                     test_action_values = test_action_values.at[agent_idx].set(action_value)
-                    test_actions = {action_name: test_action_values}
+
+                    # Update only the action in the base subs (memory efficient)
+                    # JAX dictionaries are immutable, but this creates a shallow copy
+                    # with only the action value changed
+                    test_subs = {**base_subs, action_name: test_action_values}
 
                     # Check preconditions and convert to int
-                    subs = env_state.subs.copy()
-                    subs.update(test_actions)
-                    is_valid = self._check_preconditions(subs, env_state.model_params, env_state.key)
+                    is_valid = self._check_preconditions(test_subs, model_params, key)
                     return jnp.where(is_valid, 1, 0)
 
                 # Vmap over agents, then vmap over action values
@@ -659,6 +668,10 @@ class JaxRDDLEnv:
                 # Execute vmapped computation
                 agent_indices = jnp.arange(num_agents, dtype=jnp.int32)
                 valid_mask = check_all(agent_indices)
+
+                # Convert to Python list for consistency with pyRDDLGym API
+                result[action_name] = valid_mask.tolist()
+
 
                 # Convert to Python list for consistency with pyRDDLGym API
                 result[action_name] = valid_mask.tolist()

@@ -583,6 +583,88 @@ class JaxRDDLEnv:
         subs.update(actions)
         return self._check_preconditions(subs, env_state.model_params, env_state.key)
 
+    def get_available_actions(self, env_state: EnvState) -> Dict[str, Any]:
+        """Get available (valid) actions at the current state.
+
+        Returns a dictionary mapping action names to binary masks indicating
+        which action values satisfy preconditions. For vectorized environments,
+        each agent gets its own mask.
+
+        Args:
+            env_state: Current environment state
+
+        Returns:
+            Dictionary mapping action names to validity masks:
+            - For vectorized: {'action_name': [[agent0_mask], [agent1_mask], ...]}
+              where each mask is a list of 0/1 indicating validity of each action value
+            - For non-vectorized: list of valid action dictionaries
+
+        Example:
+            ```python
+            # Vectorized environment with 2 agents, 5 possible actions each
+            masks = env.get_available_actions(env_state)
+            # Returns: {'move': [[1,0,1,0,1], [1,1,0,1,1]]}
+            # Agent 0 can take actions [0,2,4], Agent 1 can take [0,1,3,4]
+            ```
+        """
+        if not self.vectorized:
+            # Non-vectorized: enumerate all valid action combinations
+            # This is similar to the pyRDDLGym implementation
+            raise NotImplementedError(
+                "get_available_actions for non-vectorized JAX env not yet implemented. "
+                "Use vectorized=True when creating the environment."
+            )
+
+        # Vectorized: check valid actions per agent using vmap
+        result = {}
+
+        for action_name, space in self.action_space.items():
+            if isinstance(space, spaces.Box) and space.dtype in [jnp.int32, jnp.int64]:
+                # Get number of agents from shape
+                shape = space.shape
+                num_agents = shape[0] if len(shape) > 0 else 1
+
+                # Get possible values for this action
+                low = int(space.low.flatten()[0])
+                high = int(space.high.flatten()[0])
+                possible_values = jnp.arange(low, high + 1, dtype=jnp.int32)
+                num_values = len(possible_values)
+
+                # Define function to check if a single (agent, action_value) is valid
+                def check_single_action(agent_idx, action_value):
+                    # Create test action: this agent takes action_value, others take noop (0)
+                    test_action_values = jnp.zeros(num_agents, dtype=jnp.int32)
+                    test_action_values = test_action_values.at[agent_idx].set(action_value)
+                    test_actions = {action_name: test_action_values}
+
+                    # Check preconditions and convert to int
+                    subs = env_state.subs.copy()
+                    subs.update(test_actions)
+                    is_valid = self._check_preconditions(subs, env_state.model_params, env_state.key)
+                    return jnp.where(is_valid, 1, 0)
+
+                # Vmap over agents, then vmap over action values
+                # First vmap over action values for a single agent
+                check_agent_actions = jax.vmap(
+                    lambda action_value, agent_idx: check_single_action(agent_idx, action_value),
+                    in_axes=(0, None)
+                )
+
+                # Then vmap over agents
+                check_all = jax.vmap(
+                    lambda agent_idx: check_agent_actions(possible_values, agent_idx),
+                    in_axes=0
+                )
+
+                # Execute vmapped computation
+                agent_indices = jnp.arange(num_agents, dtype=jnp.int32)
+                valid_mask = check_all(agent_indices)
+
+                # Convert to Python list for consistency with pyRDDLGym API
+                result[action_name] = valid_mask.tolist()
+
+        return result
+
     def sample_random_action(self, key: PRNGKey, env_state: Optional[EnvState] = None) -> Action:
         """Sample a random action from the action space.
 

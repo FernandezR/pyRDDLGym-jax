@@ -29,7 +29,7 @@ from pyRDDLGym.core.parser.reader import RDDLReader
 from pyRDDLGym_jax.core.compiler import JaxRDDLCompiler
 from pyRDDLGym_jax.core.constraints import JaxRDDLConstraints
 from pyRDDLGym_jax.core import spaces
-
+from flax.struct import dataclass
 
 # Type aliases for clarity
 Action = Dict[str, jnp.ndarray]
@@ -38,8 +38,8 @@ State = Dict[str, jnp.ndarray]
 PRNGKey = jnp.ndarray
 Params = Any  # Model parameters (pytree)
 
-
-class EnvState(NamedTuple):
+@dataclass
+class EnvState:
     """State of the environment (all fields needed for stepping).
 
     This is a JAX pytree that contains all the information needed
@@ -65,8 +65,8 @@ class EnvState(NamedTuple):
     done: jnp.ndarray
     reward: jnp.ndarray
 
-
-class TimeStep(NamedTuple):
+@dataclass
+class TimeStep:
     """A single timestep returned by the environment.
 
     This follows the dm_env convention but adapted for JAX.
@@ -235,6 +235,38 @@ class JaxRDDLEnv:
         # Pre-compile the step and reset functions for maximum performance
         self._jit_step = jax.jit(self._step_impl)
         self._jit_reset = jax.jit(self._reset_impl)
+
+        # Pre-compute action bounds for JIT-compatible get_available_actions
+        self._action_bounds = {}
+        for action_name, space in self.action_space.items():
+            if isinstance(space, spaces.Box) and space.dtype in [jnp.int32, jnp.int64]:
+                # Extract bounds as concrete Python ints (done at init time, outside JIT)
+                low_val = space.low.flatten()[0] if hasattr(space.low, 'flatten') else space.low
+                high_val = space.high.flatten()[0] if hasattr(space.high, 'flatten') else space.high
+                # Convert to Python int to ensure it's concrete
+                low = int(np.asarray(low_val))
+                high = int(np.asarray(high_val))
+                shape = space.shape
+                num_agents = shape[0] if len(shape) > 0 else 1
+                self._action_bounds[action_name] = {
+                    'low': low,
+                    'high': high,
+                    'num_agents': num_agents,
+                    'num_values': high - low + 1
+                }
+            elif isinstance(space, spaces.Discrete):
+                self._action_bounds[action_name] = {
+                    'low': 0,
+                    'high': space.n - 1,
+                    'num_agents': 1,
+                    'num_values': space.n
+                }
+
+        # Visualizer (not used during JIT-compiled rollouts, only for rendering outside JIT)
+        self._visualizer = None
+        self._movie_generator = None
+        self._movie_per_episode = False
+        self._movies = 0
 
     @property
     def is_pomdp(self) -> bool:
@@ -477,11 +509,17 @@ class JaxRDDLEnv:
 
         Args:
             env_state: Current environment state
-            actions: Action dictionary (must match action space structure)
+            actions: Action dictionary in vectorized format (use prepare_actions_for_sim()
+                    to convert grounded actions to vectorized format before calling step)
 
         Returns:
             env_state: Next environment state
             timestep: Timestep information (observation, reward, done, etc.)
+
+        Note:
+            Actions must be in vectorized format. If you have grounded actions
+            (e.g., {'move___a1': 0, 'move___a2': 2}), call prepare_actions_for_sim()
+            first to convert them to vectorized format (e.g., {'move': [0, 2]}).
         """
         return self._jit_step(env_state, actions)
 
@@ -587,94 +625,136 @@ class JaxRDDLEnv:
         """Get available (valid) actions at the current state.
 
         Returns a dictionary mapping action names to binary masks indicating
-        which action values satisfy preconditions. For vectorized environments,
-        each agent gets its own mask.
+        which action values satisfy preconditions.
+
+        **This method is JIT-compatible** and can be used within JIT-compiled functions.
 
         Args:
             env_state: Current environment state
 
         Returns:
             Dictionary mapping action names to validity masks:
-            - For vectorized: {'action_name': [[agent0_mask], [agent1_mask], ...]}
-              where each mask is a list of 0/1 indicating validity of each action value
-            - For non-vectorized: list of valid action dictionaries
+            - For vectorized: {'action_name': jnp.array([[agent0_mask], [agent1_mask], ...])}
+              where each mask is an array of 0/1 indicating validity of each action value
+            - For non-vectorized: {'action_name': {'action_name___agent': jnp.array([mask])}}
+              where mask is an array of 0/1 for each possible action value
 
         Example:
             ```python
             # Vectorized environment with 2 agents, 5 possible actions each
             masks = env.get_available_actions(env_state)
-            # Returns: {'move': [[1,0,1,0,1], [1,1,0,1,1]]}
-            # Agent 0 can take actions [0,2,4], Agent 1 can take [0,1,3,4]
+            # Returns: {'move': jnp.array([[1,0,1,0,1], [1,1,0,1,1]])}
+
+            # Non-vectorized environment
+            masks = env.get_available_actions(env_state)
+            # Returns: {'move': {'move___a1': jnp.array([1,0,1,0,1]), 'move___a2': jnp.array([1,1,0,0,1])}}
+
+            # Can be JIT compiled
+            jit_get_actions = jax.jit(env.get_available_actions)
+            masks = jit_get_actions(env_state)
             ```
+
+        Note:
+            For non-vectorized mode, this returns a nested dict structure which is not
+            ideal for JIT but still works. For best JIT performance, use vectorized mode.
         """
         if not self.vectorized:
-            # Non-vectorized: enumerate all valid action combinations
-            # This is similar to the pyRDDLGym implementation
-            raise NotImplementedError(
-                "get_available_actions for non-vectorized JAX env not yet implemented. "
-                "Use vectorized=True when creating the environment."
-            )
+            # Non-vectorized: check each grounded action independently
+            result = {}
 
-        # Vectorized: check valid actions per agent using vmap
+            for action_name, space in self.action_space.items():
+                # Parse base action name from grounded name (e.g., 'move___a1' -> 'move')
+                base_name = action_name.split('___')[0] if '___' in action_name else action_name
+
+                if base_name not in result:
+                    result[base_name] = {}
+
+                # Get bounds from pre-computed values
+                if action_name not in self._action_bounds:
+                    continue
+
+                bounds = self._action_bounds[action_name]
+                low = bounds['low']
+                high = bounds['high']
+                possible_values = list(range(low, high + 1))
+
+                valid_mask = []
+
+                # Test each action value for this grounded action
+                for value in possible_values:
+                    # Create test action with this value for this grounded action
+                    test_action = {action_name: jnp.array(value, dtype=jnp.int32)}
+
+                    # Prepare actions (convert to vectorized format)
+                    test_action_vec = self.prepare_actions_for_sim(test_action)
+
+                    # Check if preconditions are satisfied
+                    is_valid = self.check_action_preconditions(env_state, test_action_vec)
+                    valid_mask.append(1 if is_valid else 0)
+
+                result[base_name][action_name] = jnp.array(valid_mask, dtype=jnp.int32)
+
+            return result
+
+        # Vectorized: check valid actions per agent using vmap (JIT-compatible)
+        return self._get_available_actions_vectorized(env_state)
+
+    def _get_available_actions_vectorized(self, env_state: EnvState) -> Dict[str, jnp.ndarray]:
+        """JIT-compilable version for vectorized environments.
+
+        This internal method uses pre-computed bounds and pure JAX operations.
+        """
         result = {}
 
-        for action_name, space in self.action_space.items():
-            if isinstance(space, spaces.Box) and space.dtype in [jnp.int32, jnp.int64]:
-                # Get number of agents from shape
-                shape = space.shape
-                num_agents = shape[0] if len(shape) > 0 else 1
+        for action_name in self.action_fluents:
+            if action_name not in self._action_bounds:
+                continue
 
-                # Get possible values for this action
-                low = int(space.low.flatten()[0])
-                high = int(space.high.flatten()[0])
-                possible_values = jnp.arange(low, high + 1, dtype=jnp.int32)
-                num_values = len(possible_values)
+            bounds = self._action_bounds[action_name]
+            num_agents = bounds['num_agents']
+            low = bounds['low']
+            high = bounds['high']
 
-                # Pre-create base substitution dict (shared across all checks)
-                # This avoids copying env_state.subs for every check
-                base_subs = env_state.subs
-                model_params = env_state.model_params
-                key = env_state.key
+            # Create possible values as JAX array
+            possible_values = jnp.arange(low, high + 1, dtype=jnp.int32)
 
-                # Define function to check if a single (agent, action_value) is valid
-                # This function operates on the action array only, not the full subs dict
-                def check_single_action(agent_idx, action_value):
-                    # Create test action: this agent takes action_value, others take noop (0)
-                    test_action_values = jnp.zeros(num_agents, dtype=jnp.int32)
-                    test_action_values = test_action_values.at[agent_idx].set(action_value)
+            # Pre-create base substitution dict (shared across all checks)
+            base_subs = env_state.subs
+            model_params = env_state.model_params
+            key = env_state.key
 
-                    # Update only the action in the base subs (memory efficient)
-                    # JAX dictionaries are immutable, but this creates a shallow copy
-                    # with only the action value changed
-                    test_subs = {**base_subs, action_name: test_action_values}
+            # Define function to check if a single (agent, action_value) is valid
+            def check_single_action(agent_idx, action_value):
+                # Create test action: this agent takes action_value, others take noop (0)
+                test_action_values = jnp.zeros(num_agents, dtype=jnp.int32)
+                test_action_values = test_action_values.at[agent_idx].set(action_value)
 
-                    # Check preconditions and convert to int
-                    is_valid = self._check_preconditions(test_subs, model_params, key)
-                    return jnp.where(is_valid, 1, 0)
+                # Update only the action in the base subs
+                test_subs = {**base_subs, action_name: test_action_values}
 
-                # Vmap over agents, then vmap over action values
-                # First vmap over action values for a single agent
-                check_agent_actions = jax.vmap(
-                    lambda action_value, agent_idx: check_single_action(agent_idx, action_value),
-                    in_axes=(0, None)
-                )
+                # Check preconditions and convert to int
+                is_valid = self._check_preconditions(test_subs, model_params, key)
+                return jnp.where(is_valid, 1, 0)
 
-                # Then vmap over agents
-                check_all = jax.vmap(
-                    lambda agent_idx: check_agent_actions(possible_values, agent_idx),
-                    in_axes=0
-                )
+            # Vmap over agents, then vmap over action values
+            # First vmap over action values for a single agent
+            check_agent_actions = jax.vmap(
+                lambda action_value, agent_idx: check_single_action(agent_idx, action_value),
+                in_axes=(0, None)
+            )
 
-                # Execute vmapped computation
-                agent_indices = jnp.arange(num_agents, dtype=jnp.int32)
-                valid_mask = check_all(agent_indices)
+            # Then vmap over agents
+            check_all = jax.vmap(
+                lambda agent_idx: check_agent_actions(possible_values, agent_idx),
+                in_axes=0
+            )
 
-                # Convert to Python list for consistency with pyRDDLGym API
-                result[action_name] = valid_mask.tolist()
+            # Execute vmapped computation
+            agent_indices = jnp.arange(num_agents, dtype=jnp.int32)
+            valid_mask = check_all(agent_indices)
 
-
-                # Convert to Python list for consistency with pyRDDLGym API
-                result[action_name] = valid_mask.tolist()
+            # Store as JAX array
+            result[action_name] = valid_mask
 
         return result
 
@@ -894,6 +974,146 @@ class JaxRDDLEnv:
             spec[var] = (jnp.shape(value), jnp.asarray(value).dtype)
 
         return spec
+
+    # ***********************************************************************
+    # VISUALIZATION METHODS
+    # ***********************************************************************
+
+    def set_visualizer(self, visualizer: Any, movie_gen: Optional[Any] = None,
+                      movie_per_episode: bool = False) -> None:
+        """Set the visualizer for rendering states.
+
+        The visualizer should have a render(state) method that takes a state
+        dictionary and returns an image (PIL Image or similar).
+
+        Note: Visualization is done outside JIT-compiled functions and does
+        not affect the performance of step() and reset().
+
+        Args:
+            visualizer: A visualizer object with a render(state) method.
+                       Typically an instance from pyRDDLGym.core.visualizer.*
+            movie_gen: Optional MovieGenerator for saving frames and creating animations.
+                      Use pyRDDLGym.core.visualizer.movie.MovieGenerator
+            movie_per_episode: If True, saves a separate movie file per episode.
+                             If False, accumulates all frames into a single movie.
+
+        Example:
+            ```python
+            from pyRDDLGym.core.visualizer.chart import ChartVisualizer
+            from pyRDDLGym.core.visualizer.movie import MovieGenerator
+
+            env = JaxRDDLEnv("domain.rddl", "instance.rddl")
+            viz = ChartVisualizer(env.model)
+            movie_gen = MovieGenerator("/path/to/save", "myenv", max_frames=100)
+            env.set_visualizer(viz, movie_gen=movie_gen)
+
+            # Now you can render states
+            env_state, timestep = env.reset(key)
+            image = env.render(env_state)
+
+            # Save movie when done
+            env.save_movie()
+            ```
+        """
+        self._visualizer = visualizer
+        self._movie_generator = movie_gen
+        self._movie_per_episode = movie_per_episode
+        self._movies = 0
+
+    def render(self, env_state: EnvState, save_frame: bool = True) -> Any:
+        """Render the current environment state.
+
+        This method extracts the state from the EnvState and calls the
+        visualizer's render method. It's designed to be called outside
+        JIT-compiled loops for visualization purposes.
+
+        Args:
+            env_state: The current environment state from step() or reset()
+            save_frame: If True and movie_generator is set, saves the frame
+
+        Returns:
+            image: The rendered image (typically a PIL Image), or None if
+                   no visualizer is set
+
+        Example:
+            ```python
+            env_state, timestep = env.reset(key)
+            image = env.render(env_state)
+
+            # Save or display the image
+            if image is not None:
+                image.save('state.png')
+            ```
+        """
+        if self._visualizer is None:
+            return None
+
+        # Extract state dictionary from EnvState
+        state = env_state.state
+
+        # Always convert to grounded format for visualizers
+        # (JAX env internally uses vectorized representation)
+        state = self.model.ground_vars_with_values(state)
+
+        # Convert JAX arrays to NumPy arrays for visualizer compatibility
+        state = {k: (np.asarray(v) if hasattr(v, '__array__') else v)
+                 for k, v in state.items()}
+
+        # Call visualizer's render method
+        image = self._visualizer.render(state)
+
+        # Save frame to movie generator if enabled
+        if save_frame and self._movie_generator is not None and image is not None:
+            self._movie_generator.save_frame(image)
+
+        return image
+
+    def save_movie(self, file_name: Optional[str] = None) -> None:
+        """Save the accumulated frames as a movie (GIF or MP4).
+
+        This should be called after an episode or set of episodes to generate
+        the final movie file from all the frames that were captured during
+        rendering.
+
+        Args:
+            file_name: Optional name for the movie file. If None, uses the
+                      movie_generator's default name with episode number.
+
+        Example:
+            ```python
+            from pyRDDLGym.core.visualizer.movie import MovieGenerator
+
+            # Setup
+            env.set_visualizer(viz, movie_gen=MovieGenerator(...))
+
+            # Run episode
+            env_state, _ = env.reset(key)
+            for _ in range(horizon):
+                image = env.render(env_state)  # Frames are saved automatically
+                env_state, _ = env.step(env_state, actions)
+
+            # Generate movie file
+            env.save_movie()
+            ```
+        """
+        if self._movie_generator is None:
+            warnings.warn("No movie generator set. Call set_visualizer with movie_gen parameter.")
+            return
+
+        if file_name is None:
+            file_name = self._movie_generator.env_name + '_' + str(self._movies)
+
+        self._movie_generator.save_animation(file_name)
+        self._movies += 1
+
+    def reset_movie(self) -> None:
+        """Reset the movie generator by clearing all saved frames.
+
+        Useful when starting a new episode with movie_per_episode=False
+        and you want to start fresh.
+        """
+        if self._movie_generator is not None:
+            self._movie_generator.writer.reset()
 
 
 # ***********************************************************************

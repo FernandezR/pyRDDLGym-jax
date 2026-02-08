@@ -1,4 +1,4 @@
-__version__ = '2.8'
+__version__ = '3.0'
 
 # Import the registration function for easy access
 from pyRDDLGym_jax.registration import make

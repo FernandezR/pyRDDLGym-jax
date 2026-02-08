@@ -22,6 +22,8 @@ import jax.numpy as jnp
 import jax.random as random
 import numpy as np
 
+from flax.struct import dataclass
+
 from pyRDDLGym.core.compiler.model import RDDLLiftedModel
 from pyRDDLGym.core.parser.parser import RDDLParser
 from pyRDDLGym.core.parser.reader import RDDLReader
@@ -29,7 +31,6 @@ from pyRDDLGym.core.parser.reader import RDDLReader
 from pyRDDLGym_jax.core.compiler import JaxRDDLCompiler
 from pyRDDLGym_jax.core.constraints import JaxRDDLConstraints
 from pyRDDLGym_jax.core import spaces
-from flax.struct import dataclass
 
 # Type aliases for clarity
 Action = Dict[str, jnp.ndarray]
@@ -51,7 +52,6 @@ class EnvState:
         state: Current internal state of the environment
         subs: Current substitution dictionary (internal state variables)
         key: PRNG key for stochastic sampling
-        model_params: Model parameters for stateful operations
         timestep: Current timestep in the episode
         done: Whether the episode has terminated
         reward: Cumulative reward (optional, for tracking)
@@ -60,7 +60,7 @@ class EnvState:
     state: State
     subs: Dict[str, jnp.ndarray]
     key: PRNGKey
-    model_params: Params
+    model_aux: Params
     timestep: jnp.ndarray
     done: jnp.ndarray
     reward: jnp.ndarray
@@ -182,17 +182,46 @@ class JaxRDDLEnv:
         self.init_values = self.compiler.init_values
         self.levels = self.compiler.levels
         self.traced = self.compiler.traced
-        self.model_params = self.compiler.model_params
 
-        # JIT compile the core functions
-        self._jit_reward = jax.jit(self.compiler.reward)
-        self._jit_cpfs = {cpf: jax.jit(expr)
+        # Store params and nonfluents for wrappers
+        self.model_aux = self.compiler.model_aux
+        self._nonfluent_names = set(self.model.non_fluents.keys())
+
+        # Check if reward-vector requirement is present
+        requirements = self.compiler.rddl.ast.domain.requirements if self.compiler.rddl.ast else []
+        self._use_vector_reward = 'reward-vector' in requirements
+
+        # Create wrappers that convert (subs, key) -> (value, key, error)
+        # from the compiler's (fls, nfls, params, key) -> (value, key, error, params) signature
+        def _make_wrapper(raw_fn):
+            def wrapper(subs, aux, key):
+                fls, nfls = self._split_subs(subs)
+                value, key, error, aux = raw_fn(fls, nfls, aux, key)
+                return value, key, error, aux
+            return wrapper
+
+        def _make_vector_reward_wrapper(raw_fn):
+            # Vector reward has signature (x, params, key) not (fls, nfls, params, key)
+            # where x might be a tuple (fls, nfls) or combined dict
+            def wrapper(subs, aux, key):
+                fls, nfls = self._split_subs(subs)
+                # Pass as tuple for vector reward
+                value, key, error, aux = raw_fn((fls, nfls), aux, key)
+                return value, key, error, aux
+            return wrapper
+
+        # JIT compile the core functions with wrappers
+        if self._use_vector_reward:
+            self._jit_reward = jax.jit(_make_vector_reward_wrapper(self.compiler.reward))
+        else:
+            self._jit_reward = jax.jit(_make_wrapper(self.compiler.reward))
+        self._jit_cpfs = {cpf: jax.jit(_make_wrapper(expr))
                           for cpf, expr in self.compiler.cpfs.items()}
-        self._jit_terminals = [jax.jit(term)
+        self._jit_terminals = [jax.jit(_make_wrapper(term))
                                for term in self.compiler.terminations]
-        self._jit_invariants = [jax.jit(inv)
+        self._jit_invariants = [jax.jit(_make_wrapper(inv))
                                 for inv in self.compiler.invariants]
-        self._jit_preconditions = [jax.jit(precond)
+        self._jit_preconditions = [jax.jit(_make_wrapper(precond))
                                    for precond in self.compiler.preconditions]
 
         # Store noop actions (vectorized form)
@@ -267,6 +296,19 @@ class JaxRDDLEnv:
         self._movie_generator = None
         self._movie_per_episode = False
         self._movies = 0
+
+    def _split_subs(self, subs):
+        """Split subs dict into fluents and non-fluents.
+
+        Args:
+            subs: Dictionary containing both fluents and non-fluents
+
+        Returns:
+            Tuple of (fls, nfls) dictionaries
+        """
+        fls = {name: value for name, value in subs.items() if name not in self._nonfluent_names}
+        nfls = {name: value for name, value in subs.items() if name in self._nonfluent_names}
+        return fls, nfls
 
     @property
     def is_pomdp(self) -> bool:
@@ -470,11 +512,11 @@ class JaxRDDLEnv:
             obs = state
 
         # Check if initially terminal
-        done = self._check_terminals(subs, self.model_params, key)
+        done = self._check_terminals(subs, self.model_aux, key)
 
         # Initialize reward (scalar or vector depending on reward-vector requirement)
         # We need to check the reward structure from a dummy evaluation
-        dummy_reward, _, _, _ = self._jit_reward(subs, self.model_params, key)
+        dummy_reward, _, _, _ = self._jit_reward(subs, self.model_aux, key)
         initial_reward = jnp.zeros_like(dummy_reward)
 
         # Create environment state
@@ -483,7 +525,7 @@ class JaxRDDLEnv:
             state=state,
             subs=subs,
             key=key,
-            model_params=self.model_params,
+            model_aux=self.model_aux,
             timestep=jnp.array(0, dtype=jnp.int32),
             done=done,
             reward=initial_reward
@@ -529,18 +571,17 @@ class JaxRDDLEnv:
         subs.update(actions)
 
         key = env_state.key
-        model_params = env_state.model_params
+        model_aux = env_state.model_aux
 
         # Evaluate CPFs in topological order
         for cpfs_at_level in self.levels.values():
             for cpf in cpfs_at_level:
                 cpf_fn = self._jit_cpfs[cpf]
-                value, key, error, model_params = cpf_fn(subs, model_params, key)
+                value, key, error, model_aux = cpf_fn(subs, model_aux, key)
                 subs[cpf] = value
 
         # Compute reward
-        reward, key, error, model_params = self._jit_reward(subs, model_params, key)
-
+        reward, key, error, model_aux = self._jit_reward(subs, model_aux, key)
         # Update state variables (state' -> state)
         for state_var, next_state_var in self.model.next_state.items():
             subs[state_var] = subs[next_state_var]
@@ -555,7 +596,7 @@ class JaxRDDLEnv:
             obs = state
 
         # Check termination conditions
-        done = self._check_terminals(subs, model_params, key)
+        done = self._check_terminals(subs, model_aux, key)
 
         # Check truncation (horizon limit)
         new_timestep = env_state.timestep + 1
@@ -567,7 +608,7 @@ class JaxRDDLEnv:
             state=state,
             subs=subs,
             key=key,
-            model_params=model_params,
+            model_aux=model_aux,
             timestep=new_timestep,
             done=done | truncated,
             reward=env_state.reward + reward
@@ -584,22 +625,22 @@ class JaxRDDLEnv:
 
         return new_env_state, timestep
 
-    def _check_terminals(self, subs: Dict, model_params: Params, key: PRNGKey) -> jnp.ndarray:
+    def _check_terminals(self, subs: Dict, model_aux: Params, key: PRNGKey) -> jnp.ndarray:
         """Check if any termination condition is satisfied."""
         is_terminal = jnp.array(False, dtype=bool)
         for terminal_fn in self._jit_terminals:
-            result, key, error, model_params = terminal_fn(subs, model_params, key)
+            result, key, error, model_aux = terminal_fn(subs, model_aux, key)
             is_terminal = is_terminal | result
         return is_terminal
 
-    def _check_preconditions(self, subs: Dict, model_params: Params, key: PRNGKey) -> jnp.ndarray:
+    def _check_preconditions(self, subs: Dict, model_aux: Params, key: PRNGKey) -> jnp.ndarray:
         """Check if all action preconditions are satisfied.
 
         Returns True if all preconditions are satisfied, False otherwise.
         """
         all_satisfied = jnp.array(True, dtype=bool)
         for precond_fn in self._jit_preconditions:
-            result, key, error, model_params = precond_fn(subs, model_params, key)
+            result, key, error, model_aux = precond_fn(subs, model_aux, key)
             all_satisfied = all_satisfied & result
         return all_satisfied
 
@@ -619,7 +660,7 @@ class JaxRDDLEnv:
         """
         subs = env_state.subs.copy()
         subs.update(actions)
-        return self._check_preconditions(subs, env_state.model_params, env_state.key)
+        return self._check_preconditions(subs, env_state.model_aux, env_state.key)
 
     def get_available_actions(self, env_state: EnvState) -> Dict[str, Any]:
         """Get available (valid) actions at the current state.
@@ -720,7 +761,7 @@ class JaxRDDLEnv:
 
             # Pre-create base substitution dict (shared across all checks)
             base_subs = env_state.subs
-            model_params = env_state.model_params
+            model_aux = env_state.model_aux
             key = env_state.key
 
             # Define function to check if a single (agent, action_value) is valid
@@ -733,7 +774,7 @@ class JaxRDDLEnv:
                 test_subs = {**base_subs, action_name: test_action_values}
 
                 # Check preconditions and convert to int
-                is_valid = self._check_preconditions(test_subs, model_params, key)
+                is_valid = self._check_preconditions(test_subs, model_aux, key)
                 return jnp.where(is_valid, 1, 0)
 
             # Vmap over agents, then vmap over action values

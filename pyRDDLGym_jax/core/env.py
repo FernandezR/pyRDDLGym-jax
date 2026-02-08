@@ -1021,7 +1021,7 @@ class JaxRDDLEnv:
     # ***********************************************************************
 
     def set_visualizer(self, visualizer: Any, movie_gen: Optional[Any] = None,
-                      movie_per_episode: bool = False) -> None:
+                       movie_per_episode: bool = False) -> None:
         """Set the visualizer for rendering states.
 
         The visualizer should have a render(state) method that takes a state
@@ -1155,6 +1155,14 @@ class JaxRDDLEnv:
         """
         if self._movie_generator is not None:
             self._movie_generator.writer.reset()
+
+    def reset_render(self) -> None:
+        """Reset the render state."""
+        if self._visualizer is None:
+            return None
+
+        self._visualizer.reset()
+        self.reset_movie()
 
 
 # ***********************************************************************

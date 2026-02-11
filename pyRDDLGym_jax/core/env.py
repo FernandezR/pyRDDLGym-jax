@@ -48,6 +48,7 @@ class EnvState:
     and purely functional.
 
     Attributes:
+        actions: The action taken at the current timestep (empty for initial state)
         obs: Current observation (may differ from state in POMDPs)
         state: Current internal state of the environment
         subs: Current substitution dictionary (internal state variables)
@@ -56,6 +57,7 @@ class EnvState:
         done: Whether the episode has terminated
         reward: Cumulative reward (optional, for tracking)
     """
+    actions: Action
     obs: Observation
     state: State
     subs: Dict[str, jnp.ndarray]
@@ -519,8 +521,14 @@ class JaxRDDLEnv:
         dummy_reward, _, _, _ = self._jit_reward(subs, self.model_aux, key)
         initial_reward = jnp.zeros_like(dummy_reward)
 
+        # Create proper initial actions (noop actions for consistency)
+        initial_actions = {
+            action: jnp.copy(value) for action, value in self.noop_actions.items()
+        }
+
         # Create environment state
         env_state = EnvState(
+            actions=initial_actions,  # Use noop actions for initial state
             obs=obs,
             state=state,
             subs=subs,
@@ -604,6 +612,7 @@ class JaxRDDLEnv:
 
         # Create new environment state
         new_env_state = EnvState(
+            actions=actions,
             obs=obs,
             state=state,
             subs=subs,

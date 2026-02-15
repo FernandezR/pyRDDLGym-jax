@@ -753,6 +753,11 @@ class JaxRDDLEnv:
         """JIT-compilable version for vectorized environments.
 
         This internal method uses pre-computed bounds and pure JAX operations.
+        Handles both 1D actions (shape: num_agents) and multi-dimensional actions
+        (shape: num_agents x action_dim1 x action_dim2 x ...).
+
+        Returns arrays with shape: original_action_shape + (num_values,)
+        e.g., for action shape (2, 3) with 2 possible values, returns shape (2, 3, 2)
         """
         result = {}
 
@@ -761,23 +766,35 @@ class JaxRDDLEnv:
                 continue
 
             bounds = self._action_bounds[action_name]
-            num_agents = bounds['num_agents']
             low = bounds['low']
             high = bounds['high']
 
+            # Get the action shape from noop_actions
+            action_shape = self.noop_actions[action_name].shape
+
             # Create possible values as JAX array
             possible_values = jnp.arange(low, high + 1, dtype=jnp.int32)
+            num_values = len(possible_values)
 
             # Pre-create base substitution dict (shared across all checks)
             base_subs = env_state.subs
             model_aux = env_state.model_aux
             key = env_state.key
 
-            # Define function to check if a single (agent, action_value) is valid
-            def check_single_action(agent_idx, action_value):
-                # Create test action: this agent takes action_value, others take noop (0)
-                test_action_values = jnp.zeros(num_agents, dtype=jnp.int32)
-                test_action_values = test_action_values.at[agent_idx].set(action_value)
+            # Flatten the action array to get all positions
+            # Use np.prod on shape tuple since it's static
+            flat_size = int(np.prod(action_shape))
+
+            # Define function to check if a single position/value combination is valid
+            def check_single_position_value(flat_idx, action_value):
+                # Create test action with noop values everywhere
+                test_action_values = jnp.zeros(action_shape, dtype=jnp.int32)
+
+                # Convert flat index to multi-dimensional index
+                multi_idx = jnp.unravel_index(flat_idx, action_shape)
+
+                # Set the specific position to the test value
+                test_action_values = test_action_values.at[multi_idx].set(action_value)
 
                 # Update only the action in the base subs
                 test_subs = {**base_subs, action_name: test_action_values}
@@ -786,24 +803,29 @@ class JaxRDDLEnv:
                 is_valid = self._check_preconditions(test_subs, model_aux, key)
                 return jnp.where(is_valid, 1, 0)
 
-            # Vmap over agents, then vmap over action values
-            # First vmap over action values for a single agent
-            check_agent_actions = jax.vmap(
-                lambda action_value, agent_idx: check_single_action(agent_idx, action_value),
+            # Vmap over positions, then vmap over action values
+            # First vmap over action values for a single position
+            check_position_values = jax.vmap(
+                lambda action_value, flat_idx: check_single_position_value(flat_idx, action_value),
                 in_axes=(0, None)
             )
 
-            # Then vmap over agents
+            # Then vmap over all positions
             check_all = jax.vmap(
-                lambda agent_idx: check_agent_actions(possible_values, agent_idx),
+                lambda flat_idx: check_position_values(possible_values, flat_idx),
                 in_axes=0
             )
 
             # Execute vmapped computation
-            agent_indices = jnp.arange(num_agents, dtype=jnp.int32)
-            valid_mask = check_all(agent_indices)
+            flat_indices = jnp.arange(flat_size, dtype=jnp.int32)
+            valid_mask_flat = check_all(flat_indices)  # Shape: (flat_size, num_values)
 
-            # Store as JAX array
+            # Reshape to maintain original action shape + num_values dimension
+            # e.g., (6, 2) -> (2, 3, 2) for action shape (2, 3) with 2 values
+            result_shape = action_shape + (num_values,)
+            valid_mask = jnp.reshape(valid_mask_flat, result_shape)
+
+            # Store as JAX array with original shape preserved
             result[action_name] = valid_mask
 
         return result

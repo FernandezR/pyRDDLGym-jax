@@ -51,7 +51,8 @@ class EnvState:
         actions: The action taken at the current timestep (empty for initial state)
         obs: Current observation (may differ from state in POMDPs)
         state: Current internal state of the environment
-        subs: Current substitution dictionary (internal state variables)
+        subs: Current substitution dictionary (fluents AND non-fluents — non-fluents
+              are included so callers can read and modify them at runtime)
         key: PRNG key for stochastic sampling
         timestep: Current timestep in the episode
         done: Whether the episode has terminated
@@ -189,42 +190,78 @@ class JaxRDDLEnv:
         self.model_aux = self.compiler.model_aux
         self._nonfluent_names = set(self.model.non_fluents.keys())
 
+        # Pre-compute non-fluents as JAX constant arrays (also available for inspection).
+        self._nfls = {
+            k: jnp.array(v)
+            for k, v in self.init_values.items()
+            if k in self._nonfluent_names
+        }
+
         # Check if reward-vector requirement is present
         requirements = self.compiler.rddl.ast.domain.requirements if self.compiler.rddl.ast else []
         self._use_vector_reward = 'reward-vector' in requirements
 
-        # Create wrappers that convert (subs, key) -> (value, key, error)
-        # from the compiler's (fls, nfls, params, key) -> (value, key, error, params) signature
+        # Create wrappers that convert (subs, aux, key) -> (value, key, error, aux)
+        # from the compiler's (fls, nfls, aux, key) -> (value, key, error, aux) signature.
+        # subs contains both fluents and non-fluents; we split them at call time so
+        # that any modifications to non-fluents in EnvState.subs are respected.
+        _nf_names = self._nonfluent_names
+
         def _make_wrapper(raw_fn):
             def wrapper(subs, aux, key):
-                fls, nfls = self._split_subs(subs)
+                fls = {k: v for k, v in subs.items() if k not in _nf_names}
+                nfls = {k: v for k, v in subs.items() if k in _nf_names}
                 value, key, error, aux = raw_fn(fls, nfls, aux, key)
                 return value, key, error, aux
             return wrapper
 
         def _make_vector_reward_wrapper(raw_fn):
-            # Vector reward has signature (x, params, key) not (fls, nfls, params, key)
-            # where x might be a tuple (fls, nfls) or combined dict
             def wrapper(subs, aux, key):
-                fls, nfls = self._split_subs(subs)
-                # Pass as tuple for vector reward
+                fls = {k: v for k, v in subs.items() if k not in _nf_names}
+                nfls = {k: v for k, v in subs.items() if k in _nf_names}
                 value, key, error, aux = raw_fn((fls, nfls), aux, key)
                 return value, key, error, aux
             return wrapper
 
-        # JIT compile the core functions with wrappers
+        # JIT compile reward and constraint functions.
         if self._use_vector_reward:
             self._jit_reward = jax.jit(_make_vector_reward_wrapper(self.compiler.reward))
         else:
             self._jit_reward = jax.jit(_make_wrapper(self.compiler.reward))
-        self._jit_cpfs = {cpf: jax.jit(_make_wrapper(expr))
-                          for cpf, expr in self.compiler.cpfs.items()}
         self._jit_terminals = [jax.jit(_make_wrapper(term))
                                for term in self.compiler.terminations]
         self._jit_invariants = [jax.jit(_make_wrapper(inv))
                                 for inv in self.compiler.invariants]
         self._jit_preconditions = [jax.jit(_make_wrapper(precond))
                                    for precond in self.compiler.preconditions]
+
+        # Compile all CPFs into a single JIT function executed in topological
+        # order. This is more efficient than N individually JIT-compiled CPF
+        # functions: the outer jax.jit(_step_impl) would inline them anyway,
+        # so separate jax.jit decorators only add tracing/cache overhead.
+        _cpfs_in_order = [
+            (cpf, _make_wrapper(self.compiler.cpfs[cpf]))
+            for level in self.levels.values()
+            for cpf in level
+        ]
+
+        def _all_cpfs_impl(subs, aux, key):
+            subs = dict(subs)  # shallow copy — do not mutate the input pytree
+            for cpf_name, cpf_fn in _cpfs_in_order:
+                value, key, _err, aux = cpf_fn(subs, aux, key)
+                subs[cpf_name] = value
+            return subs, key, aux
+
+        self._jit_all_cpfs = jax.jit(_all_cpfs_impl)
+
+        # Pre-compute zero reward once so _reset_impl avoids a dummy
+        # reward evaluation on every reset call.
+        _subs_for_shape = {k: jnp.array(v) for k, v in self.init_values.items()}
+        _sample_reward, _, _, _ = self._jit_reward(
+            _subs_for_shape, self.model_aux, jax.random.PRNGKey(0)
+        )
+        self._zero_reward = jnp.zeros_like(_sample_reward)
+        del _subs_for_shape, _sample_reward
 
         # Store noop actions (vectorized form)
         self.noop_actions = {
@@ -499,8 +536,9 @@ class JaxRDDLEnv:
 
     def _reset_impl(self, key: PRNGKey) -> Tuple[EnvState, TimeStep]:
         """Internal implementation of reset (to be JIT-compiled)."""
-        # Initialize substitution dict with initial values
-        subs = self.init_values.copy()
+        # Build full subs including both fluents and non-fluents so that callers
+        # can read and modify any variable (including non-fluents) via EnvState.subs.
+        subs = {k: jnp.array(v) for k, v in self.init_values.items()}
 
         # Extract state
         state = {
@@ -516,15 +554,12 @@ class JaxRDDLEnv:
         # Check if initially terminal
         done = self._check_terminals(subs, self.model_aux, key)
 
-        # Initialize reward (scalar or vector depending on reward-vector requirement)
-        # We need to check the reward structure from a dummy evaluation
-        dummy_reward, _, _, _ = self._jit_reward(subs, self.model_aux, key)
-        initial_reward = jnp.zeros_like(dummy_reward)
+        # Use pre-computed zero reward (avoids a dummy reward call on every reset).
+        initial_reward = self._zero_reward
 
-        # Create proper initial actions (noop actions for consistency)
-        initial_actions = {
-            action: jnp.copy(value) for action, value in self.noop_actions.items()
-        }
+        # Initial actions are the noop actions; no copy needed since JAX arrays
+        # are immutable and EnvState fields are not mutated in place.
+        initial_actions = self.noop_actions
 
         # Create environment state
         env_state = EnvState(
@@ -581,12 +616,10 @@ class JaxRDDLEnv:
         key = env_state.key
         model_aux = env_state.model_aux
 
-        # Evaluate CPFs in topological order
-        for cpfs_at_level in self.levels.values():
-            for cpf in cpfs_at_level:
-                cpf_fn = self._jit_cpfs[cpf]
-                value, key, error, model_aux = cpf_fn(subs, model_aux, key)
-                subs[cpf] = value
+        # Evaluate all CPFs in topological order via a single compiled call.
+        # _jit_all_cpfs returns an updated fls dict containing all computed
+        # CPF values (derived, intermediate, next-state, etc.).
+        subs, key, model_aux = self._jit_all_cpfs(subs, model_aux, key)
 
         # Compute reward
         reward, key, error, model_aux = self._jit_reward(subs, model_aux, key)

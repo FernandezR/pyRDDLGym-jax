@@ -52,10 +52,12 @@ class EnvState:
     `subs` using the env helper methods (get_state, get_obs, get_actions).
 
     Attributes:
-        subs: Full substitution dictionary (state + action + non-fluents +
-              derived/interm fluents). Non-fluents are included so callers
-              can read and modify them at runtime. Primed state variables
-              (x') are stripped after each step — they are transient.
+        subs: Substitution dictionary containing state fluents, action fluents,
+              derived/interm fluents, and *randomizable* non-fluents only.
+              Static non-fluents are excluded — they live in the JIT closure
+              and are shared across all parallel environments at zero VRAM cost.
+              Use env.get_nonfluents(env_state) to retrieve all non-fluents.
+              Primed state variables (x') are stripped after each step — they are transient.
         key: PRNG key for stochastic sampling
         model_aux: Model parameters (for differentiable/learnable models)
         timestep: Current timestep in the episode
@@ -141,6 +143,7 @@ class JaxRDDLEnv:
                  logger: Optional[Any] = None,
                  vectorized: bool = True,
                  python_functions: Optional[Dict[str, Callable]] = None,
+                 randomizable_nonfluents: Optional[set] = None,
                  **compiler_kwargs) -> None:
         """Initialize the JAX environment.
 
@@ -152,6 +155,18 @@ class JaxRDDLEnv:
                        If True (default), actions and observations are JAX arrays.
                        If False, actions and observations are dictionaries of scalars (grounded).
             python_functions: External Python functions callable from RDDL
+            randomizable_nonfluents: Controls which non-fluents live in EnvState.subs
+                       vs. the JIT closure.
+
+                       - None (default): ALL non-fluents go into EnvState.subs.
+                         Fully backward-compatible; no VRAM savings under vmap.
+                       - set() (empty set): ALL non-fluents go into the JIT closure
+                         as XLA compile-time constants — maximum VRAM savings, but
+                         none are accessible via EnvState.subs.
+                       - {'wall', 'map', ...}: Only the named non-fluents live in
+                         EnvState.subs (can be randomized per episode); all others
+                         are baked into the closure and never replicated across
+                         parallel environments.
             **compiler_kwargs: Additional arguments for the JAX compiler
         """
         # Store vectorization flag
@@ -191,16 +206,40 @@ class JaxRDDLEnv:
         self.model_aux = self.compiler.model_aux
         self._nonfluent_names = set(self.model.non_fluents.keys())
 
+        # Split non-fluents into two groups:
+        #   randomizable — stored in EnvState.subs so they can be swapped between
+        #                  episodes (e.g. procedurally-generated maps / layouts).
+        #   static       — baked into JIT closures as XLA compile-time constants;
+        #                  they are never part of the EnvState pytree so vmap does
+        #                  NOT replicate them N times across parallel environments.
+        #
+        # Default (None): ALL non-fluents go into subs — backward compatible.
+        # Empty set:      ALL non-fluents go into closure — maximum VRAM savings.
+        # Named set:      Only the named subset goes into subs; rest into closure.
+        self._random_nonfluent_names: set = (
+            self._nonfluent_names              # all in subs — backward compat
+            if randomizable_nonfluents is None
+            else set(randomizable_nonfluents) & self._nonfluent_names
+        )
+        self._static_nonfluent_names: set = (
+            self._nonfluent_names - self._random_nonfluent_names
+        )
+
         # Primed state variable names (e.g. "x'") — computed transiently inside
         # _all_cpfs_impl and stripped from subs before storing in EnvState.
         # This prevents doubling the state footprint between steps.
         self._primed_state_keys = frozenset(self.model.next_state.values())
 
-        # Pre-compute non-fluents as JAX constant arrays (also available for inspection).
+        # Pre-compute ALL non-fluents as JAX arrays (full dict for inspection).
         self._nfls = {
             k: jnp.array(v)
             for k, v in self.init_values.items()
             if k in self._nonfluent_names
+        }
+        # Static-only sub-dict captured by closures.
+        self._static_nfls = {
+            k: v for k, v in self._nfls.items()
+            if k in self._static_nonfluent_names
         }
 
         # Check if reward-vector requirement is present
@@ -209,22 +248,31 @@ class JaxRDDLEnv:
 
         # Create wrappers that convert (subs, aux, key) -> (value, key, error, aux)
         # from the compiler's (fls, nfls, aux, key) -> (value, key, error, aux) signature.
-        # subs contains both fluents and non-fluents; we split them at call time so
-        # that any modifications to non-fluents in EnvState.subs are respected.
-        _nf_names = self._nonfluent_names
+        #
+        # Non-fluent handling:
+        #   static non-fluents  — captured by closure (_static_nfls_const); XLA bakes
+        #                         them as compile-time constants, so vmap never replicates
+        #                         them across parallel environments.
+        #   randomizable non-fluents — read from subs at call time so runtime changes
+        #                         (e.g. new map layouts between episodes) are picked up.
+        _nf_names          = self._nonfluent_names
+        _random_nf_names   = self._random_nonfluent_names
+        _static_nfls_const = self._static_nfls  # captured once, never on-device per-env
 
         def _make_wrapper(raw_fn):
             def wrapper(subs, aux, key):
-                fls = {k: v for k, v in subs.items() if k not in _nf_names}
-                nfls = {k: v for k, v in subs.items() if k in _nf_names}
+                fls  = {k: v for k, v in subs.items() if k not in _nf_names}
+                nfls = {**_static_nfls_const,
+                        **{k: v for k, v in subs.items() if k in _random_nf_names}}
                 value, key, error, aux = raw_fn(fls, nfls, aux, key)
                 return value, key, error, aux
             return wrapper
 
         def _make_vector_reward_wrapper(raw_fn):
             def wrapper(subs, aux, key):
-                fls = {k: v for k, v in subs.items() if k not in _nf_names}
-                nfls = {k: v for k, v in subs.items() if k in _nf_names}
+                fls  = {k: v for k, v in subs.items() if k not in _nf_names}
+                nfls = {**_static_nfls_const,
+                        **{k: v for k, v in subs.items() if k in _random_nf_names}}
                 value, key, error, aux = raw_fn((fls, nfls), aux, key)
                 return value, key, error, aux
             return wrapper
@@ -262,7 +310,15 @@ class JaxRDDLEnv:
 
         # Pre-compute zero reward once so _reset_impl avoids a dummy
         # reward evaluation on every reset call.
-        _subs_for_shape = {k: jnp.array(v) for k, v in self.init_values.items()}
+        # Static non-fluents are excluded — the wrapper supplies them from closure.
+        # Primed state keys (e.g. "collision'") are intentionally INCLUDED here:
+        # the reward function may reference them, and init_values contains their
+        # default values. They are only excluded from EnvState.subs (where they
+        # must not persist between steps), not from this temporary shape-probe dict.
+        _subs_for_shape = {
+            k: jnp.array(v) for k, v in self.init_values.items()
+            if k not in self._static_nonfluent_names
+        }
         _sample_reward, _, _, _ = self._jit_reward(
             _subs_for_shape, self.model_aux, jax.random.PRNGKey(0)
         )
@@ -542,17 +598,16 @@ class JaxRDDLEnv:
 
     def _reset_impl(self, key: PRNGKey) -> Tuple[EnvState, TimeStep]:
         """Internal implementation of reset (to be JIT-compiled)."""
-        # Build full subs including both fluents and non-fluents so that callers
-        # can read and modify any variable (including non-fluents) via EnvState.subs.
-        # init_values contains state, action, and non-fluents (no primed/derived/interm),
-        # so the subs here is already minimal.
-        subs = {k: jnp.array(v) for k, v in self.init_values.items()}
-
-        # Strip primed state variables (x') — they are transient and only needed
-        # during CPF evaluation. Removing them here prevents doubling the
-        # state-fluent device memory between steps.
-        for primed_key in self._primed_state_keys:
-            del subs[primed_key]
+        # Build subs from fluents + randomizable non-fluents.
+        # Static non-fluents are intentionally excluded: they live in the JIT
+        # closure (_static_nfls_const) and are never replicated per environment
+        # under vmap. Randomizable non-fluents (self._random_nonfluent_names) are
+        # included so callers can swap them between episodes. Primed state keys are
+        # excluded because they are transient (only needed inside _all_cpfs_impl).
+        subs = {
+            k: jnp.array(v) for k, v in self.init_values.items()
+            if k not in self._static_nonfluent_names and k not in self._primed_state_keys
+        }
 
         # Check if initially terminal
         done = self._check_terminals(subs, self.model_aux, key)
@@ -692,6 +747,32 @@ class JaxRDDLEnv:
     # (state, obs, and actions are not stored directly in EnvState to
     #  avoid tripling device memory via pytree leaf duplication)
     # ------------------------------------------------------------------
+
+    def get_nonfluents(self, env_state: Optional['EnvState'] = None) -> Dict[str, jnp.ndarray]:
+        """Return all non-fluent values (both static and randomizable).
+
+        Non-fluents are split into two groups at init time:
+          - static non-fluents: baked into JIT closures; returned from env._static_nfls.
+          - randomizable non-fluents: stored in EnvState.subs; if env_state is
+            provided their current (possibly modified) values are returned.
+
+        Args:
+            env_state: If provided, reads randomizable non-fluents from this
+                       state's subs (reflects any in-place modifications).
+                       If None, returns init-time values for all non-fluents.
+
+        Returns:
+            Dictionary mapping non-fluent names to their JAX arrays.
+        """
+        # Static non-fluents always come from the closure dict.
+        result = dict(self._static_nfls)
+        # Randomizable non-fluents come from subs (if available) or init-time _nfls.
+        for k in self._random_nonfluent_names:
+            if env_state is not None and k in env_state.subs:
+                result[k] = env_state.subs[k]
+            else:
+                result[k] = self._nfls[k]
+        return result
 
     def get_state(self, env_state: EnvState) -> State:
         """Extract current state fluents from EnvState.subs.

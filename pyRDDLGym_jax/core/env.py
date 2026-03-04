@@ -47,20 +47,21 @@ class EnvState:
     to step the environment forward. It's designed to be immutable
     and purely functional.
 
+    Only the minimum set of fields is stored to avoid redundant device
+    buffers. Observations, state, and actions can all be extracted from
+    `subs` using the env helper methods (get_state, get_obs, get_actions).
+
     Attributes:
-        actions: The action taken at the current timestep (empty for initial state)
-        obs: Current observation (may differ from state in POMDPs)
-        state: Current internal state of the environment
-        subs: Current substitution dictionary (fluents AND non-fluents — non-fluents
-              are included so callers can read and modify them at runtime)
+        subs: Full substitution dictionary (state + action + non-fluents +
+              derived/interm fluents). Non-fluents are included so callers
+              can read and modify them at runtime. Primed state variables
+              (x') are stripped after each step — they are transient.
         key: PRNG key for stochastic sampling
+        model_aux: Model parameters (for differentiable/learnable models)
         timestep: Current timestep in the episode
-        done: Whether the episode has terminated
-        reward: Cumulative reward (optional, for tracking)
+        done: Whether the episode has terminated or been truncated
+        reward: Cumulative reward accumulated so far in the episode
     """
-    actions: Action
-    obs: Observation
-    state: State
     subs: Dict[str, jnp.ndarray]
     key: PRNGKey
     model_aux: Params
@@ -189,6 +190,11 @@ class JaxRDDLEnv:
         # Store params and nonfluents for wrappers
         self.model_aux = self.compiler.model_aux
         self._nonfluent_names = set(self.model.non_fluents.keys())
+
+        # Primed state variable names (e.g. "x'") — computed transiently inside
+        # _all_cpfs_impl and stripped from subs before storing in EnvState.
+        # This prevents doubling the state footprint between steps.
+        self._primed_state_keys = frozenset(self.model.next_state.values())
 
         # Pre-compute non-fluents as JAX constant arrays (also available for inspection).
         self._nfls = {
@@ -538,34 +544,30 @@ class JaxRDDLEnv:
         """Internal implementation of reset (to be JIT-compiled)."""
         # Build full subs including both fluents and non-fluents so that callers
         # can read and modify any variable (including non-fluents) via EnvState.subs.
+        # init_values contains state, action, and non-fluents (no primed/derived/interm),
+        # so the subs here is already minimal.
         subs = {k: jnp.array(v) for k, v in self.init_values.items()}
 
-        # Extract state
-        state = {
-            var: subs[var] for var in self.state_fluents
-        }
-
-        # Extract observation (for POMDPs) or use state (for MDPs)
-        if self._is_pomdp:
-            obs = {var: subs[var] for var in self.observ_fluents}
-        else:
-            obs = state
+        # Strip primed state variables (x') — they are transient and only needed
+        # during CPF evaluation. Removing them here prevents doubling the
+        # state-fluent device memory between steps.
+        for primed_key in self._primed_state_keys:
+            del subs[primed_key]
 
         # Check if initially terminal
         done = self._check_terminals(subs, self.model_aux, key)
 
+        # Extract obs for the initial TimeStep (not stored in EnvState).
+        if self._is_pomdp:
+            obs = {var: subs[var] for var in self.observ_fluents}
+        else:
+            obs = {var: subs[var] for var in self.state_fluents}
+
         # Use pre-computed zero reward (avoids a dummy reward call on every reset).
         initial_reward = self._zero_reward
 
-        # Initial actions are the noop actions; no copy needed since JAX arrays
-        # are immutable and EnvState fields are not mutated in place.
-        initial_actions = self.noop_actions
-
-        # Create environment state
+        # Create environment state — no state/obs/actions fields; extract from subs.
         env_state = EnvState(
-            actions=initial_actions,  # Use noop actions for initial state
-            obs=obs,
-            state=state,
             subs=subs,
             key=key,
             model_aux=self.model_aux,
@@ -617,37 +619,36 @@ class JaxRDDLEnv:
         model_aux = env_state.model_aux
 
         # Evaluate all CPFs in topological order via a single compiled call.
-        # _jit_all_cpfs returns an updated fls dict containing all computed
+        # _jit_all_cpfs returns an updated subs dict containing all computed
         # CPF values (derived, intermediate, next-state, etc.).
         subs, key, model_aux = self._jit_all_cpfs(subs, model_aux, key)
 
         # Compute reward
         reward, key, error, model_aux = self._jit_reward(subs, model_aux, key)
-        # Update state variables (state' -> state)
+
+        # Advance state: copy x' -> x for all state fluents.
         for state_var, next_state_var in self.model.next_state.items():
             subs[state_var] = subs[next_state_var]
 
-        # Extract new state
-        state = {var: subs[var] for var in self.state_fluents}
+        # Strip primed state variables (x') — they are transient and only needed
+        # during CPF evaluation. Removing them here prevents doubling the
+        # state-fluent device memory between steps.
+        for primed_key in self._primed_state_keys:
+            del subs[primed_key]
 
-        # Extract observation
-        if self._is_pomdp:
-            obs = {var: subs[var] for var in self.observ_fluents}
-        else:
-            obs = state
-
-        # Check termination conditions
+        # Check termination / truncation (uses updated state in subs).
         done = self._check_terminals(subs, model_aux, key)
-
-        # Check truncation (horizon limit)
         new_timestep = env_state.timestep + 1
         truncated = new_timestep >= self.horizon
 
-        # Create new environment state
+        # Extract obs for TimeStep only (not stored in EnvState — use get_obs()).
+        if self._is_pomdp:
+            obs = {var: subs[var] for var in self.observ_fluents}
+        else:
+            obs = {var: subs[var] for var in self.state_fluents}
+
+        # Create new environment state — subs holds the full updated state.
         new_env_state = EnvState(
-            actions=actions,
-            obs=obs,
-            state=state,
             subs=subs,
             key=key,
             model_aux=model_aux,
@@ -685,6 +686,41 @@ class JaxRDDLEnv:
             result, key, error, model_aux = precond_fn(subs, model_aux, key)
             all_satisfied = all_satisfied & result
         return all_satisfied
+
+    # ------------------------------------------------------------------
+    # Convenience extractors
+    # (state, obs, and actions are not stored directly in EnvState to
+    #  avoid tripling device memory via pytree leaf duplication)
+    # ------------------------------------------------------------------
+
+    def get_state(self, env_state: EnvState) -> State:
+        """Extract current state fluents from EnvState.subs.
+
+        Returns:
+            Dictionary mapping state-fluent names to their current arrays.
+        """
+        return {var: env_state.subs[var] for var in self.state_fluents}
+
+    def get_obs(self, env_state: EnvState) -> Observation:
+        """Extract current observation from EnvState.subs.
+
+        For MDPs this is identical to get_state(). For POMDPs it returns
+        the observation fluents.
+
+        Returns:
+            Dictionary mapping observation variable names to their arrays.
+        """
+        if self._is_pomdp:
+            return {var: env_state.subs[var] for var in self.observ_fluents}
+        return self.get_state(env_state)
+
+    def get_actions(self, env_state: EnvState) -> Action:
+        """Extract the last action taken from EnvState.subs.
+
+        Returns:
+            Dictionary mapping action-fluent names to their arrays.
+        """
+        return {var: env_state.subs[var] for var in self.action_fluents}
 
     def check_action_preconditions(self, env_state: EnvState, actions: Action) -> bool:
         """Check if the given actions satisfy all preconditions.
@@ -1153,8 +1189,8 @@ class JaxRDDLEnv:
         if self._visualizer is None:
             return None
 
-        # Extract state dictionary from EnvState
-        state = env_state.state
+        # Extract state from subs (state fluents are always present in subs).
+        state = {var: env_state.subs[var] for var in self.state_fluents}
 
         # Always convert to grounded format for visualizers
         # (JAX env internally uses vectorized representation)
